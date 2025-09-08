@@ -3,3 +3,6 @@
 *.pt
 *.jpg
 *.png
+*.json
+*.pyc
+*.zip
