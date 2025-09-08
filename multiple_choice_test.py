@@ -1,459 +1,546 @@
 # -*- coding: utf-8 -*-
-# YOLO11s + 5지선다(사람크기) 1회 측정 → 고정 + 정사각형 그리드(원근 축소 옵션)
-# - 샘플 대역: 화면 높이 20~40%
-# - 프리셋 스케일: 아주작음일수록 셀이 더 큼(1>2>3>4>5)
-# - ROI 밖은 전혀 그리지 않음(오버레이도 ROI로 클립)
-# - P: 원근(행별 5% 축소) 토글
+"""
+멀티-ROI 군중 밀집 파이프라인 (모듈화 버전)
+- 설계 합의 사항 반영:
+  * YOLO 단 1회/프레임 추론 (타일 오버랩 + 글로벌 NMS)
+  * 캘리브레이션: 화면 중간밴드(20~40%)에서 사람 "키(px)" 표본 수집 → robust median → 1회 확정(freeze)
+  * 그리드: 프레임 하단 기준 전역 원근 함수로 행별 셀 크기(side)를 결정(옵션 A)
+  * 멀티-ROI: ROI 유무 상관없이 동일 인터페이스(ROI 없으면 풀프레임 자동 ROI 1개 생성)
+  * 렌더링: ROI 내부만 블렌딩(바깥은 원본 밝기 유지)
+  * 키입력: [1..5], +/- (프리셋/파인), H/F (참조점), R(재측정), Q/ESC(종료)
 
-import subprocess, shutil, time, cv2, math
-import numpy as np
+참고(Ultralytics 사용 포인트):
+- 모델 로딩: YOLO(MODEL)
+- 배치 추론: results = model(list_of_numpy_images, conf=..., imgsz=..., device=..., half=..., classes=[0])
+- bbox/점수 접근: for res in results: res.boxes.xyxy, res.boxes.conf
+
+※ 위 인터페이스는 Ultralytics 공식 API에 기반한 일반적인 사용법입니다.
+"""
+
+from __future__ import annotations
+import cv2, numpy as np, time, math, subprocess, shutil
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional
 from collections import deque
 from ultralytics import YOLO
 
-# ========= 기본 설정 =========
-YOUTUBE_URL = "https://www.youtube.com/live/rnXIjl_Rzy4?feature=shared"
-# YOUTUBE_URL = "https://www.youtube.com/live/EaRgJQ--2eE"
-# YOUTUBE_URL = "https://www.youtube.com/watch?v=u4UZ4UvZXrg"
-MODEL   = "epoch30.pt"
-DEVICE  = "cpu"
-IMGSZ   = 640
-CONF    = 0.35
-USE_HALF= False
-ROWS_TILES, COLS_TILES = 2, 4
-
-# --- 자동 측정 관련 ---
-AUTO_MIN_SAMPLES = 12          # 자동확정에 필요한 최소 샘플 수(기존 25 → 12)
-AUTO_TIMEOUT_SEC = 25.0        # 이 시간 지나면 강제 확정
-# 샘플 필터 완화(사람이 적은 장면 대비)
-MIN_H_PX_FOR_SAMPLE = 32       # 36 → 32
-ASPECT_MIN = 1.25              # 1.35 → 1.25
-
-# --- 사람 위치 참조점 설정 ---
-USE_HEAD_POINT = True       # True=머리(y1), False=발끝(y2)
-ROI_TEST_WITH_REF = True    # ROI 포함 여부도 같은 점으로 검사(True 권장)
+# =============================
+# 0) 공용 타입/유틸
+# =============================
+@dataclass
+class Det:
+    x1: float; y1: float; x2: float; y2: float; conf: float; cls: int = 0
 
 
-# 사람-크기 5지선다 (Very big 일수록 더 큰 셀)
-PRESET_NAMES   = ["Very big", "big", "Normal", "small", "Very small"] # 사람 크기에 따라 분류
-PRESET_FACTORS = [1.95, 1.75, 1.45, 1.20, 1.00]
-BASE_K_FROM_PERSON_H = 0.90
-MID_BAND = (0.20, 0.40)      # 20~40%
+def iou_xyxy(a: Tuple[float,float,float,float,float], b: Tuple[float,float,float,float,float]) -> float:
+    ax1, ay1, ax2, ay2 = a[:4]; bx1, by1, bx2, by2 = b[:4]
+    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1); ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0: return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / (area_a + area_b - inter + 1e-9)
 
-# 셀/표시
-MIN_CELL_PX = 12
-MAX_CELL_PX = 120
-ALERT_THRESHOLD = 5
-FILL_ALPHA = 0.45
-DRAW_COUNTS = True
 
-# 자동/고정
-AUTO_RECALC_SEC = 1.5
-FREEZE_AFTER_FIRST_BUILD = True
+def nms_global(boxes: List[Tuple[float,float,float,float,float]], iou_th: float=0.55) -> List[Tuple[float,float,float,float,float]]:
+    """간단한 전역 NMS. 점수 내림차순 정렬 후, IoU 임계치 이상을 제거."""
+    boxes = sorted(boxes, key=lambda x: x[4], reverse=True)
+    keep = []
+    while boxes:
+        cur = boxes.pop(0)
+        keep.append(cur)
+        boxes = [b for b in boxes if iou_xyxy(cur, b) < iou_th]
+    return keep
 
-# 표시
-DISPLAY_MAX_W = 1280
-DISPLAY_MAX_H = 720
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-def resize_to_fit(img, max_w=DISPLAY_MAX_W, max_h=DISPLAY_MAX_H):
-    h, w = img.shape[:2]
-    s = min(max_w / w, max_h / h, 1.0)
-    return cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA) if s < 1.0 else img
-def show_fit(name, img):
-    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-    cv2.imshow(name, resize_to_fit(img))
-def compute_fit_scale(w, h, max_w=DISPLAY_MAX_W, max_h=DISPLAY_MAX_H):
-    return min(max_w / w, max_h / h, 1.0)
 
-def ref_point(x1, y1, x2, y2, use_head=True):
-    """사람 박스의 기준점 반환 (머리 or 발끝)"""
+def ref_point(x1: float, y1: float, x2: float, y2: float, use_head: bool=True) -> Tuple[float,float]:
+    """사람 박스의 참조점(머리: top-center / 발끝: bottom-center)."""
     cx = 0.5 * (x1 + x2)
     cy = y1 if use_head else y2
     return cx, cy
 
 
-# ========= streamlink =========
-def resolve_stream(url: str) -> str:
-    exe = (shutil.which("streamlink")
-           or r"C:\Users\user\anaconda3\envs\py39\Scripts\streamlink.exe")
-    if not exe: raise RuntimeError("streamlink 실행파일을 찾지 못했습니다.")
-    out = subprocess.run([exe, "--stream-url", url, "best"],
-                         capture_output=True, text=True, check=True)
-    s = out.stdout.strip()
-    if not s: raise RuntimeError("streamlink로 스트림 URL 얻기 실패")
-    return s
-
-# ========= ROI =========
-def click_roi(first):
-    roi = []
-    SCALE = compute_fit_scale(first.shape[1], first.shape[0])
-    def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            roi.append([int(round(x / SCALE)), int(round(y / SCALE))])
-    cv2.namedWindow("Draw ROI polygon", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("Draw ROI polygon", on_mouse)
-    while True:
-        disp = first.copy()
-        for i, (px, py) in enumerate(roi):
-            cv2.circle(disp, (px, py), 4, (0,200,255), -1)
-            if i > 0: cv2.line(disp, tuple(roi[i-1]), (px, py), (0,200,255), 2)
-        if len(roi) >= 3: cv2.line(disp, tuple(roi[-1]), tuple(roi[0]), (0,200,255), 1)
-        cv2.putText(disp, "ROI click(3+) → Enter (r=reset)", (20,20), FONT, 0.7, (255,255,255), 2)
-        show_fit("Draw ROI polygon", disp)
-        k = cv2.waitKey(30) & 0xFF
-        if k == 27: cv2.destroyAllWindows(); raise SystemExit
-        if k == ord('r'): roi = []
-        if k == 13 and len(roi) >= 3: break
-    cv2.destroyWindow("Draw ROI polygon")
-    return np.array(roi, dtype=np.int32)
-
-def polygon_mask(h, w, poly):
+def polygon_mask(h: int, w: int, poly: np.ndarray) -> np.ndarray:
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(mask, [poly.astype(np.int32)], 255)
     return mask
 
-# ========= 타일 추론/NMS =========
-def split_tiles(frame, rows=2, cols=4):
-    h, w = frame.shape[:2]
-    hs = [int(round(r*h/rows)) for r in range(rows+1)]
-    ws = [int(round(c*w/cols)) for c in range(cols+1)]
-    crops, offs = [], []
-    for r in range(rows):
-        for c in range(cols):
-            y1,y2 = hs[r], hs[r+1]; x1,x2 = ws[c], ws[c+1]
-            crops.append(frame[y1:y2, x1:x2]); offs.append((x1,y1))
-    return crops, offs
 
-def iou_xyxy(a,b):
-    ax1,ay1,ax2,ay2=a[:4]; bx1,by1,bx2,by2=b[:4]
-    ix1=max(ax1,bx1); iy1=max(ay1,by1); ix2=min(ax2,bx2); iy2=min(ay2,by2)
-    iw=max(0.0,ix2-ix1); ih=max(0.0,iy2-iy1); inter=iw*ih
-    if inter<=0: return 0.0
-    area_a=max(0.0,ax2-ax1)*max(0.0,ay2-ay1)
-    area_b=max(0.0,bx2-bx1)*max(0.0,by2-by1)
-    return inter/(area_a+area_b-inter+1e-9)
+def apply_overlay_in_mask(frame: np.ndarray, overlay: np.ndarray, mask: np.ndarray, alpha: float) -> np.ndarray:
+    """ROI 내부만 반투명 합성(바깥은 원본 유지)."""
+    blended = cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
+    out = frame.copy()
+    out[mask > 0] = blended[mask > 0]
+    return out
 
-def nms_global(boxes, iou_th=0.55):
-    boxes=sorted(boxes, key=lambda x:x[4], reverse=True)
-    keep=[]
-    while boxes:
-        cur=boxes.pop(0); keep.append(cur)
-        boxes=[b for b in boxes if iou_xyxy(cur,b) < iou_th]
-    return keep
 
-# ========= 다각형 교차(셀 표시 여부) =========
-def _pt_in_poly(pt, poly):
-    return cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), False) >= 0
-def _seg_intersect(p1,p2,q1,q2):
-    def ccw(a,b,c): return (c[1]-a[1])*(b[0]-a[0]) - (b[1]-a[1])*(c[0]-a[0])
-    A=ccw(p1,p2,q1); B=ccw(p1,p2,q2); C=ccw(q1,q2,p1); D=ccw(q1,q2,p2)
-    if A==B==C==D==0:
-        if max(min(p1[0],p2[0]), min(q1[0],q2[0])) <= min(max(p1[0],p2[0]), max(q1[0],q2[0])) and \
-           max(min(p1[1],p2[1]), min(q1[1],q2[1])) <= min(max(p1[1],p2[1]), max(q1[1],q2[1])):
-            return True
-        return False
-    return (A*B<=0) and (C*D<=0)
-def poly_intersects(poly_a, poly_b):
-    for p in poly_a:
-        if _pt_in_poly(p, poly_b): return True
-    for p in poly_b:
-        if _pt_in_poly(p, poly_a): return True
-    A=poly_a; B=poly_b
-    for i in range(len(A)):
-        a1 = tuple(A[i]); a2 = tuple(A[(i+1)%len(A)])
-        for j in range(len(B)):
-            b1 = tuple(B[j]); b2 = tuple(B[(j+1)%len(B)])
-            if _seg_intersect(a1,a2,b1,b2): return True
-    return False
+# =============================
+# 1) 설정/상태
+# =============================
+@dataclass
+class AppConfig:
+    # 입력/모델
+    youtube_url: str = "https://www.youtube.com/live/rnXIjl_Rzy4?feature=shared"
+    model_path: str = "epoch30.pt"
+    device: str = "cpu"
+    imgsz: int = 640
+    conf: float = 0.35  # 탐지 신뢰도 임계치(기본 0.35)
+    use_half: bool = False
+    classes: List[int] = field(default_factory=lambda: [0])  # person only
 
-# ========= 정사각형 그리드 (원근 옵션) =========
-class VarSquareGrid:
-    """
-    ROI 바운딩박스 안을 '정사각형'으로 채우되,
-    아래에서 위로 갈수록 한 행씩 (1 - shrink)^r 만큼 축소시킴.
-    - cells: list of dict {poly(4x2 int32), row, col}
-    """
-    def __init__(self, roi_poly, img_h, img_w):
-        self.poly = roi_poly.astype(np.int32)
-        self.h, self.w = img_h, img_w
-        x,y,w,h = cv2.boundingRect(self.poly)
-        self.bbox = (x,y,w,h)
-        self.cells = []
-        self.base_side = None
-        self.shrink = 0.05  # 기본 5%씩 축소
-        self.perspective_on = True
+    # 타일링
+    tile_rows: int = 2
+    tile_cols: int = 4
+    tile_overlap: int = 32
 
-    def build(self, base_side_px: float):
-        self.base_side = int(max(MIN_CELL_PX, min(MAX_CELL_PX, round(base_side_px))))
-        self.cells = []
-        x, y, w, h = self.bbox
-        # 아래 → 위로 행 생성
-        y_bot = y + h
-        row = 0
-        while True:
-            side = self.base_side
-            if self.perspective_on:
-                side = max(MIN_CELL_PX, int(round(self.base_side * ((1.0 - self.shrink) ** row))))
-            y_top = y_bot - side
-            if y_top < y:  # 넘어가면 마지막 줄만 남기고 종료
-                break
-            # 열 생성 (정사각형)
-            x0 = x  # 좌측부터
-            col = 0
-            while x0 < x + w:
-                poly = np.array([[x0, y_top],
-                                 [x0+side, y_top],
-                                 [x0+side, y_bot],
-                                 [x0, y_bot]], dtype=np.int32)
-                self.cells.append(dict(poly=poly, row=row, col=col, side=side))
-                x0 += side
-                col += 1
-            y_bot = y_top
-            row  += 1
-        return len(self.cells) > 0
+    # 캘리브레이션(중간밴드)
+    mid_band: Tuple[float,float] = (0.20, 0.40) # 표본을 모을 세로 밴드(동영상 화면기준 20%에서 40% 사이에서 사람 크기 확인)
+    auto_min_samples: int = 12      # 측정 확정 조건 (기본 12 사람 디텍팅 후 확정)
+    auto_timeout_sec: float = 25.0  # 측정 확정 조건 (사람을 auto_min_samples값만큼 잡지 못한 경우 25초 후에 강제 확정)
+    min_h_px: int = 32
+    aspect_min: float = 1.25
 
-    def locate(self, x, y):
-        # 간단: 셀 리스트를 순회(셀 수가 많지 않으므로 OK)
+    # 그리드/표시
+    base_k_from_person_h: float = 0.90  # 셀 변 = unit_mid × α × K의 K값
+    shrink_per_row: float = 0.05 # 위로 갈수록 셀 줄이는 비율(기본 0.05) ex) 행 별로  0.05씩 비율이 줄어들음
+    min_cell_px: int = 12
+    max_cell_px: int = 120
+    alert_threshold: int = 5 # 알림 기준 카운트(기본 5) ex) 5명 이상이면 빨간색으로 표시
+    fill_alpha: float = 0.45
+
+    # 디스플레이
+    display_max_w: int = 1280
+    display_max_h: int = 720
+    win_name: str = "Crowd Grid (Modular)"
+
+
+def compute_fit_scale(w: int, h: int, max_w: int, max_h: int) -> float:
+    return min(max_w / w, max_h / h, 1.0)
+
+
+def show_fit(name: str, img: np.ndarray, max_w: int, max_h: int):
+    h, w = img.shape[:2]
+    s = compute_fit_scale(w, h, max_w, max_h)
+    if s < 1.0:
+        img = cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    cv2.imshow(name, img)
+
+
+@dataclass
+class RuntimeState:
+    use_head_point: bool = True      # HEAD(True)/FOOT(False)
+    preset_idx: int = 2              # 0..4 (Very big .. Very small) # α(배수) 조정 값
+    fine_factor: float = 1.0         # α(배수) 조정 값
+    alpha_values: Tuple[float,...] = (1.95, 1.75, 1.45, 1.20, 1.00)
+
+    unit_mid: Optional[float] = None # 확정된 앵커(px)
+    frozen: bool = False
+    measure_started: float = field(default_factory=time.time)
+
+    def alpha(self) -> float:
+        return self.alpha_values[self.preset_idx] * self.fine_factor
+
+
+# =============================
+# 2) 입력/타일러/모델러
+# =============================
+class StreamResolver:
+    """YouTube → stream URL (streamlink)."""
+    @staticmethod
+    def resolve(url: str) -> str:
+        exe = (shutil.which("streamlink") or r"C:\\Users\\user\\anaconda3\\envs\\py39\\Scripts\\streamlink.exe")
+        if not exe:
+            raise RuntimeError("streamlink 실행파일을 찾지 못했습니다.")
+        out = subprocess.run([exe, "--stream-url", url, "best"], capture_output=True, text=True, check=True)
+        s = out.stdout.strip()
+        if not s:
+            raise RuntimeError("streamlink로 스트림 URL 얻기 실패")
+        return s
+
+
+class Tiler:
+    """프레임을 rows×cols 타일로 나누되 경계에 overlap을 적용."""
+    def __init__(self, rows: int, cols: int, overlap: int):
+        self.rows, self.cols, self.overlap = rows, cols, overlap
+
+    def split(self, frame: np.ndarray) -> Tuple[List[np.ndarray], List[Tuple[int,int]]]:
+        h, w = frame.shape[:2]
+        hs = [int(round(r*h/self.rows)) for r in range(self.rows+1)]
+        ws = [int(round(c*w/self.cols)) for c in range(self.cols+1)]
+        crops, offs = [], []
+        for r in range(self.rows):
+            for c in range(self.cols):
+                y1, y2 = hs[r], hs[r+1]
+                x1, x2 = ws[c], ws[c+1]
+                y1e = max(0, y1 - (self.overlap if r > 0 else 0))
+                y2e = min(h, y2 + (self.overlap if r < self.rows-1 else 0))
+                x1e = max(0, x1 - (self.overlap if c > 0 else 0))
+                x2e = min(w, x2 + (self.overlap if c < self.cols-1 else 0))
+                crops.append(frame[y1e:y2e, x1e:x2e])
+                offs.append((x1e, y1e))
+        return crops, offs
+
+
+class ModelRunner:
+    """Ultralytics YOLO 추론(타일 배치 → 글로벌 NMS)"""
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.model = YOLO(cfg.model_path)
+        self.tiler = Tiler(cfg.tile_rows, cfg.tile_cols, cfg.tile_overlap)
+
+    def infer(self, frame: np.ndarray) -> List[Det]:
+        crops, offs = self.tiler.split(frame)
+        results = self.model(crops, conf=self.cfg.conf, imgsz=self.cfg.imgsz,
+                             device=self.cfg.device, half=self.cfg.use_half,
+                             classes=self.cfg.classes)
+        pooled = []  # (x1,y1,x2,y2,conf)
+        for res, (ox, oy) in zip(results, offs):
+            boxes = res.boxes
+            if boxes is None or len(boxes) == 0:
+                continue
+            xyxy = boxes.xyxy.cpu().numpy(); confs = boxes.conf.cpu().numpy()
+            for (x1,y1,x2,y2), cf in zip(xyxy, confs):
+                pooled.append((x1+ox, y1+oy, x2+ox, y2+oy, float(cf)))
+        kept = nms_global(pooled, iou_th=0.55)
+        return [Det(*b[:4], b[4], 0) for b in kept]
+
+
+# =============================
+# 3) ROI
+# =============================
+@dataclass
+class Roi:
+    # 현재 버전은 ROI가 없으면 풀프레임 1개 ROI를 자동 생성해서 동작
+    id: int
+    name: str
+    polygon: np.ndarray  # (N,2)
+    mask: np.ndarray     # (H,W) uint8
+    bbox: Tuple[int,int,int,int]  # (x,y,w,h)
+
+    @staticmethod
+    def full_frame(h: int, w: int, idx: int=0) -> "Roi":
+        poly = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.int32)
+        mask = polygon_mask(h, w, poly)
+        x,y,ww,hh = cv2.boundingRect(poly)
+        return Roi(idx, f"FULL_{idx}", poly, mask, (x,y,ww,hh))
+
+
+class RoiManager:
+    def __init__(self):
+        self._rois: List[Roi] = []
+        self._active_id: Optional[int] = None
+        self._next_id: int = 0
+
+    def ensure_default(self, h: int, w: int):
+        if not self._rois:
+            r = Roi.full_frame(h, w, idx=self._next_id)
+            self._rois.append(r)
+            self._active_id = r.id
+            self._next_id += 1
+
+    # 수동으로 ROI 추가
+    def add_polygon(self, poly: np.ndarray, h: int, w: int, name: Optional[str]=None) -> Roi: 
+        mask = polygon_mask(h, w, poly)
+        x,y,ww,hh = cv2.boundingRect(poly)
+        r = Roi(self._next_id, name or f"ROI_{self._next_id}", poly.astype(np.int32), mask, (x,y,ww,hh))
+        self._rois.append(r); self._active_id = r.id; self._next_id += 1
+        return r
+
+    def remove_active(self):
+        if self._active_id is None: return
+        self._rois = [r for r in self._rois if r.id != self._active_id]
+        self._active_id = self._rois[0].id if self._rois else None
+
+    def cycle_active(self):
+        if not self._rois: return
+        ids = [r.id for r in self._rois]
+        if self._active_id not in ids:
+            self._active_id = ids[0]; return
+        i = ids.index(self._active_id); self._active_id = ids[(i+1)%len(ids)]
+
+    def list(self) -> List[Roi]:
+        return list(self._rois)
+
+    def active(self) -> Optional[Roi]:
+        for r in self._rois:
+            if r.id == self._active_id:
+                return r
+        return None
+
+
+# =============================
+# 4) 앵커(중간밴드) 캘리브레이션
+# =============================
+class AnchorCalibrator:
+    """중간밴드(20~40%)에서 사람 높이(h=y2-y1) 표본을 모아 1회 unit_mid 확정."""
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.hbuf_mid: deque = deque(maxlen=300)
+        self.reset()
+
+    def reset(self):
+        self.hbuf_mid.clear()
+        self.started_ts = time.time()
+        self.unit_mid: Optional[float] = None
+
+    def add_sample(self, det: Det, ref_y: float, is_inside_roi: bool):
+        if not is_inside_roi:
+            return
+        h = det.y2 - det.y1; w = det.x2 - det.x1
+        if h < self.cfg.min_h_px or w <= 0: return
+        if (h/(w+1e-9)) < self.cfg.aspect_min: return
+        y_low, y_high = int(self.cfg.mid_band[0]*ref_y*0 + 0), int(self.cfg.mid_band[1]*ref_y*0 + 0)  # dummy (unused)
+        # 실제 판정은 호출 측에서 수행(참조점 y가 mid_band 안인지)
+        self.hbuf_mid.append(h)
+
+    def ready(self) -> bool:
+        enough = (len(self.hbuf_mid) >= self.cfg.auto_min_samples)
+        timeout = ((time.time() - self.started_ts) > self.cfg.auto_timeout_sec and len(self.hbuf_mid) >= max(5, self.cfg.auto_min_samples//2))
+        return enough or timeout
+
+    def finalize(self, frame_h: int) -> float:
+        def robust_median(arr: np.ndarray) -> Optional[float]:
+            if arr.size == 0: return None
+            q10, q90 = np.percentile(arr, [10, 90])
+            arr = arr[(arr >= q10) & (arr <= q90)]
+            if arr.size == 0: return None
+            return float(np.median(arr))
+        arr = np.asarray(self.hbuf_mid, dtype=np.float32)
+        unit = robust_median(arr)
+        if unit is None:
+            unit = max(self.cfg.min_h_px, int(0.065 * frame_h))  # 보수적 대체값
+        self.unit_mid = unit
+        return unit
+
+
+# =============================
+# 5) 그리드(옵션 A: 전역 원근)
+# =============================
+@dataclass
+class Cell:
+    poly: np.ndarray  # (4,2) int32
+    row_rel: int
+    col: int
+    side: int
+
+
+@dataclass
+class Grid:
+    cells: List[Cell]
+    base_side_mid: int  # mid 밴드 기준 행의 셀 변
+
+    def locate(self, x: float, y: float) -> Optional[int]:
+        # 빠른 AABB 체크(정사각형이므로 좌표 비교)
         for idx, c in enumerate(self.cells):
-            p = c["poly"]
+            p = c.poly
             if (x >= p[0,0]) and (x <= p[1,0]) and (y > p[0,1]) and (y <= p[2,1]):
                 return idx
         return None
 
-# ========= 메인 =========
-def main():
-    global USE_HEAD_POINT   # ← 이 줄 추가 (머리/발끝 토글 변수는 전역 정의였으니)
-    stream_url = resolve_stream(YOUTUBE_URL)
+
+class GridBuilder:
+    def __init__(self, cfg: AppConfig, frame_h: int):
+        self.cfg = cfg
+        self.H = frame_h
+
+    def build(self, roi: Roi, unit_mid: float, alpha: float) -> Grid:
+        # 1) mid 기준 셀 변 계산
+        base_side_mid = int(max(self.cfg.min_cell_px, min(self.cfg.max_cell_px, round(self.cfg.base_k_from_person_h * unit_mid * alpha))))
+        cells: List[Cell] = []
+        x, y, w, h = roi.bbox
+        y_bot = y + h
+        # ROI의 하단이 프레임 하단에서 몇 번째 행인지(전역)
+        row0 = max(0, int(math.floor((self.H - y_bot) / max(1, base_side_mid))))
+        row = 0
+        while True:
+            row_rel = row0 + row
+            # 행별 side(y)
+            side = max(self.cfg.min_cell_px, int(round(base_side_mid * ((1.0 - self.cfg.shrink_per_row) ** row_rel))))
+            y_top = y_bot - side
+            if y_top < y:
+                break
+            x0 = x; col = 0
+            while x0 < x + w:
+                poly = np.array([[x0, y_top],[x0+side, y_top],[x0+side, y_bot],[x0, y_bot]], dtype=np.int32)
+                cells.append(Cell(poly=poly, row_rel=row_rel, col=col, side=side))
+                x0 += side; col += 1
+            y_bot = y_top; row += 1
+        return Grid(cells=cells, base_side_mid=base_side_mid)
+
+
+# =============================
+# 6) 카운터
+# =============================
+class Counter:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+
+    def count(self, dets: List[Det], roi: Roi, grid: Grid, use_head_point: bool, roi_test_with_ref: bool=True) -> Dict[int,int]:
+        counts: Dict[int,int] = {}
+        H, W = roi.mask.shape
+        for d in dets:
+            if d.conf < self.cfg.conf: continue
+            rx, ry = ref_point(d.x1, d.y1, d.x2, d.y2, use_head_point)
+            # ROI 포함 검사(참조점 기준)
+            testx, testy = (rx, ry) if roi_test_with_ref else ref_point(d.x1, d.y1, d.x2, d.y2, use_head=False)
+            ix = int(min(max(testx, 0), W-1)); iy = int(min(max(testy, 0), H-1))
+            if roi.mask[iy, ix] == 0: continue
+            idx = grid.locate(rx, ry)
+            if idx is None: continue
+            counts[idx] = counts.get(idx, 0) + 1
+        return counts
+
+
+# =============================
+# 7) 렌더러(OSD 포함)
+# =============================
+class Renderer:
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+
+    def draw_roi(self, frame: np.ndarray, roi: Roi, grid: Optional[Grid], counts: Optional[Dict[int,int]]) -> np.ndarray:
+        overlay = frame.copy()
+        if grid is not None:
+            for i, c in enumerate(grid.cells):
+                poly = c.poly
+                # ROI의 실제 폴리곤 내부만 그리도록 하려면 교차 판정 추가 가능(단, 비용↑)
+                n = counts.get(i, 0) if counts is not None else 0
+                if n >= self.cfg.alert_threshold: color=(0,0,255)
+                elif n > 0:                      color=(0,180,0)
+                else:                             color=(180,180,180)
+                if c.side >= self.cfg.min_cell_px:
+                    cv2.fillPoly(overlay, [poly], color)
+                    cv2.polylines(overlay, [poly], True, (50,50,50), 1)
+        out = apply_overlay_in_mask(frame, overlay, roi.mask, self.cfg.fill_alpha)
+        cv2.polylines(out, [roi.polygon], True, (0,200,255), 2)
+        return out
+
+    def draw_osd(self, img: np.ndarray, rt: RuntimeState, unit_mid_txt: str, mode_txt: str):
+        # 상단 상태 텍스트
+        cv2.putText(img, f"{mode_txt}", (12,28), self.FONT, 0.7, (0,0,0), 3)
+        cv2.putText(img, f"{mode_txt}", (12,28), self.FONT, 0.7, (255,255,255), 1)
+        ref_txt = "HEAD" if rt.use_head_point else "FOOT"
+        line = f"{unit_mid_txt}  x{rt.alpha():.2f}  shrink/row={cfg.shrink_per_row:.3f}  ref={ref_txt} [H/F]"
+        cv2.putText(img, line, (12,52), self.FONT, 0.7, (0,0,0), 3)
+        cv2.putText(img, line, (12,52), self.FONT, 0.7, (255,255,255), 1)
+        cv2.putText(img, "Manual: [1..5]=preset  +/-=size  R=remeasure  H/F=head/foot", (12,76), self.FONT, 0.7, (0,0,0), 3)
+        cv2.putText(img, "Manual: [1..5]=preset  +/-=size  R=remeasure  H/F=head/foot", (12,76), self.FONT, 0.7, (255,255,255), 1)
+
+
+# =============================
+# 8) 메인 루프
+# =============================
+if __name__ == "__main__":
+    cfg = AppConfig()
+    rt  = RuntimeState()
+
+    # 스트림 오픈(YouTube → streamlink)
+    stream_url = StreamResolver.resolve(cfg.youtube_url)
     cap = cv2.VideoCapture(stream_url)
-    if not cap.isOpened(): raise RuntimeError("VideoCapture 열기 실패")
+    if not cap.isOpened():
+        raise RuntimeError("VideoCapture 열기 실패")
 
     ok, first = cap.read()
-    if not ok: raise RuntimeError("첫 프레임 읽기 실패")
-    fr_h, fr_w = first.shape[:2]
+    if not ok:
+        raise RuntimeError("첫 프레임 읽기 실패")
+    H, W = first.shape[:2]
 
-    roi_poly = click_roi(first)
-    roi_mask = polygon_mask(fr_h, fr_w, roi_poly)
+    # ROI 준비(없으면 풀프레임 1개 자동 생성)
+    roi_mgr = RoiManager()
+    roi_mgr.ensure_default(H, W)
 
-    model = YOLO(MODEL)
+    # 모듈 준비
+    model = ModelRunner(cfg)
+    calibr = AnchorCalibrator(cfg)
+    grid_builder = GridBuilder(cfg, frame_h=H)
+    counter = Counter(cfg)
+    renderer = Renderer(cfg)
 
-    grid = VarSquareGrid(roi_poly, fr_h, fr_w)
-    cur_preset = 2
-    fine_factor = 1.0
-    gamma = 1.0
-
-    # --- NEW: ROI 확정 즉시 보이는 임시 격자 ---
-    # fallback_h_px = max(MIN_H_PX_FOR_SAMPLE, int(0.065 * fr_h))  # 프레임 높이의 ~6.5%를 임시 사람키로 가정
-    # init_side = max(MIN_CELL_PX, min(MAX_CELL_PX,
-    #             int(BASE_K_FROM_PERSON_H * fallback_h_px * PRESET_FACTORS[cur_preset] * fine_factor)))
-    # grid.build(init_side)          # 미리 한 번 그려주기 (자동 측정 끝나면 덮어씀)
-    measure_started = time.time()   # <-- NEW: 자동 측정 타이머 시작
-
-    hbuf = deque(maxlen=300)
-    last_auto = 0.0
-    grid_frozen = False
-
+    grid_cache: Dict[int, Grid] = {}  # roi.id → Grid
 
     while cap.isOpened():
         ok, frame = cap.read()
-        if not ok: break
+        if not ok:
+            break
 
-        # 감마 옵션
-        if gamma != 1.0:
-            f = np.clip(((frame/255.0) ** (1.0/gamma))*255.0, 0, 255).astype(np.uint8)
-            frame = f
+        # 1) 추론(1회/프레임)
+        dets = model.infer(frame)
 
-        crops, offs = split_tiles(frame, ROWS_TILES, COLS_TILES)
-        results = model(crops, conf=CONF, imgsz=IMGSZ, device=DEVICE, half=USE_HALF, classes=[0])
-
-        all_boxes=[]
-        for res,(ox,oy) in zip(results, offs):
-            boxes=res.boxes
-            if boxes is None or len(boxes)==0: continue
-            xyxy = boxes.xyxy.cpu().numpy(); confs=boxes.conf.cpu().numpy()
-            for (x1,y1,x2,y2),cf in zip(xyxy,confs):
-                all_boxes.append([x1+ox, y1+oy, x2+ox, y2+oy, float(cf)])
-        kept = nms_global(all_boxes, iou_th=0.55)
-
-        # # A) 샘플 수집(20~40% + 부족하면 40~65%) 발끝
-        # y_low, y_high = int(MID_BAND[0]*fr_h), int(MID_BAND[1]*fr_h)
-        # y_low2, y_high2 = int(0.40*fr_h), int(0.65*fr_h)  # 보조 밴드
-
-        # if not grid_frozen:
-        #     for x1,y1,x2,y2,cf in kept:
-        #         if cf < 0.35:   # 0.45 → 0.35 (완화)
-        #             continue
-        #         h = y2-y1; w = x2-x1
-        #         if h < MIN_H_PX_FOR_SAMPLE or w <= 0:
-        #             continue
-        #         if (h/(w+1e-9)) < ASPECT_MIN:
-        #             continue
-        #         footx = 0.5*(x1+x2); footy = y2
-        #         if roi_mask[int(min(max(footy,0),fr_h-1)), int(min(max(footx,0),fr_w-1))] == 0:
-        #             continue
-
-        #         # 기본 밴드 또는 보조 밴드에서 수집
-        #         if y_low <= footy <= y_high or y_low2 <= footy <= y_high2:
-        #             hbuf.append(h)
-        
-        # A) 샘플 수집(20~40% + 부족하면 40~65%, ROI 내부) 머리
-        y_low, y_high   = int(MID_BAND[0]*fr_h), int(MID_BAND[1]*fr_h)
-        y_low2, y_high2 = int(0.40*fr_h), int(0.65*fr_h)
-
-        if not grid_frozen:
-            for x1,y1,x2,y2,cf in kept:
-                if cf < 0.35: 
+        # 2) 측정 단계: mid 밴드에서 표본 수집 (freeze 전)
+        if not rt.frozen:
+            mid_low, mid_high = int(cfg.mid_band[0]*H), int(cfg.mid_band[1]*H)
+            for d in dets:
+                if d.conf < cfg.conf: continue
+                rx, ry = ref_point(d.x1, d.y1, d.x2, d.y2, rt.use_head_point)
+                if not (mid_low <= ry <= mid_high):
                     continue
-                h = y2 - y1; w = x2 - x1
-                if h < MIN_H_PX_FOR_SAMPLE or w <= 0:
-                    continue
-                if (h/(w+1e-9)) < ASPECT_MIN:
-                    continue
+                # ROI 포함 여부: 전역 앵커이므로 활성 ROI가 아닌, 기본 ROI(풀프레임)로 판정 OK
+                r0 = roi_mgr.active() or roi_mgr.list()[0]
+                ix = int(min(max(rx, 0), W-1)); iy = int(min(max(ry, 0), H-1))
+                inside = (r0.mask[iy, ix] > 0)
+                calibr.add_sample(d, ry, inside)
 
-                rx, ry = ref_point(x1,y1,x2,y2, use_head=USE_HEAD_POINT)
-                # ROI 포함 검사
-                testx, testy = (rx, ry) if ROI_TEST_WITH_REF else ref_point(x1,y1,x2,y2, use_head=False)  # False=발끝
-                if roi_mask[int(min(max(testy,0),fr_h-1)), int(min(max(testx,0),fr_w-1))] == 0:
-                    continue
+            # 3) 조건 충족 시 앵커 확정 → 모든 ROI 그리드 생성
+            if calibr.ready():
+                rt.unit_mid = calibr.finalize(frame_h=H)
+                rt.frozen = True
+                grid_cache.clear()
+                for roi in roi_mgr.list():
+                    g = grid_builder.build(roi, unit_mid=rt.unit_mid, alpha=rt.alpha())
+                    grid_cache[roi.id] = g
 
-                # 밴드 조건
-                if y_low <= ry <= y_high or y_low2 <= ry <= y_high2:
-                    hbuf.append(h)
+        # 프리셋/± 조정은 freeze 이후 바로 재빌드
+        def rebuild_all():
+            grid_cache.clear()
+            for roi in roi_mgr.list():
+                g = grid_builder.build(roi, unit_mid=rt.unit_mid, alpha=rt.alpha())
+                grid_cache[roi.id] = g
 
+        # 4) 카운트 + 렌더링(ROI별)
+        out = frame.copy()
+        for roi in roi_mgr.list():
+            g = grid_cache.get(roi.id)
+            counts = None
+            if g is not None:
+                counts = counter.count(dets, roi, g, use_head_point=rt.use_head_point, roi_test_with_ref=True)
+            out = renderer.draw_roi(out, roi, g, counts)
 
-        # B) 자동 프리셋(처음만)
-        now = time.time()
-        enough_samples = (len(hbuf) >= AUTO_MIN_SAMPLES)
-        timeout_passed = ((now - measure_started) > AUTO_TIMEOUT_SEC and len(hbuf) >= max(5, AUTO_MIN_SAMPLES//2))
+        # OSD
+        mode_txt = f"measuring... samples={len(calibr.hbuf_mid)}/{cfg.auto_min_samples}" if not rt.frozen else "frozen"
+        unit_txt = f"unit_mid={rt.unit_mid:.1f}px" if rt.unit_mid is not None else "unit_mid=--"
+        renderer.draw_osd(out, rt, unit_txt, mode_txt)
 
-        if (not grid_frozen) and (enough_samples or timeout_passed):
-            if len(hbuf) > 0:
-                med_h = float(np.median(hbuf))
-            else:
-                med_h = max(MIN_H_PX_FOR_SAMPLE, int(0.065 * fr_h))  # 완전 무샘플이면 안전한 대체값
-            base_side = max(MIN_CELL_PX, min(MAX_CELL_PX,
-                        BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
-            grid.build(base_side)
-            grid_frozen = True
+        # 디스플레이
+        show_fit(cfg.win_name, out, cfg.display_max_w, cfg.display_max_h)
 
-
-        # C) 수동/재측정/토글
+        # 5) 키 입력
         k = cv2.waitKey(1) & 0xFF
-
-        if k in (27, ord('q')): break
-        if k in (ord('1'),ord('2'),ord('3'),ord('4'),ord('5')):
-            cur_preset = int(chr(k)) - 1
-            med_h = float(np.median(hbuf)) if len(hbuf)>0 else 60.0
-            base_side = max(MIN_CELL_PX,
-                            min(MAX_CELL_PX, BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
-            grid.build(base_side); grid_frozen = True
-        elif k in (ord('+'), ord('=')):
-            fine_factor *= 1.05
-            med_h = float(np.median(hbuf)) if len(hbuf)>0 else 60.0
-            base_side = max(MIN_CELL_PX,
-                            min(MAX_CELL_PX, BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
-            grid.build(base_side); grid_frozen = True
-        elif k in (ord('-'), ord('_')):
-            fine_factor /= 1.05
-            med_h = float(np.median(hbuf)) if len(hbuf)>0 else 60.0
-            base_side = max(MIN_CELL_PX,
-                            min(MAX_CELL_PX, BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
-            grid.build(base_side); grid_frozen = True
-            
+        if k in (27, ord('q'), ord('Q')):
+            break
         elif k in (ord('h'), ord('H')):
-            USE_HEAD_POINT = True     # 머리 기준
+            rt.use_head_point = True
         elif k in (ord('f'), ord('F')):
-            USE_HEAD_POINT = False    # 발끝 기준
-            
+            rt.use_head_point = False
+        elif k in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5')):
+            if rt.frozen and rt.unit_mid is not None:
+                rt.preset_idx = int(chr(k)) - 1
+                rebuild_all()
+        elif k in (ord('+'), ord('=')):
+            if rt.frozen and rt.unit_mid is not None:
+                rt.fine_factor *= 1.05
+                rebuild_all()
+        elif k in (ord('-'), ord('_')):
+            if rt.frozen and rt.unit_mid is not None:
+                rt.fine_factor /= 1.05
+                rebuild_all()
         elif k in (ord('r'), ord('R')):
-            hbuf.clear(); last_auto = 0.0; grid_frozen = False
-        elif k in (ord('p'), ord('P')):
-            grid.perspective_on = not grid.perspective_on
-            # 재빌드
-            med_h = float(np.median(hbuf)) if len(hbuf)>0 else 60.0
-            base_side = max(MIN_CELL_PX,
-                            min(MAX_CELL_PX, BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
-            grid.build(base_side)
-
-        # # D) 카운트(발끝이 ROI 안일 때만)
-        # counts = {}
-        # if grid.base_side is not None:
-        #     for x1,y1,x2,y2,cf in kept:
-        #         footx = 0.5*(x1+x2); footy = y2
-        #         if roi_mask[int(min(max(footy,0),fr_h-1)), int(min(max(footx,0),fr_w-1))] == 0: continue
-        #         idx = grid.locate(footx, footy)
-        #         if idx is None: continue
-        #         counts[idx] = counts.get(idx, 0) + 1
-        
-        # D) 카운트(참조점(머리)이 ROI 안일 때만)
-        counts = {}
-        if grid.base_side is not None:
-            for x1,y1,x2,y2,cf in kept:
-                rx, ry = ref_point(x1,y1,x2,y2, use_head=USE_HEAD_POINT)
-                testx, testy = (rx, ry) if ROI_TEST_WITH_REF else ref_point(x1,y1,x2,y2, use_head=False)
-                if roi_mask[int(min(max(testy,0),fr_h-1)), int(min(max(testx,0),fr_w-1))] == 0:
-                    continue
-                idx = grid.locate(rx, ry)
-                if idx is None: 
-                    continue
-                counts[idx] = counts.get(idx, 0) + 1
-
-
-        # E) 렌더링(ROI와 전혀 겹치지 않는 셀은 숨김) + ROI 마스크로 클립
-        overlay = frame.copy()
-        if grid.base_side is not None:
-            for i, c in enumerate(grid.cells):
-                poly = c["poly"]
-                if not poly_intersects(poly, roi_poly):  # 완전 바깥이면 스킵
-                    continue
-                n = counts.get(i, 0)
-                if n >= ALERT_THRESHOLD: color=(0,0,255)
-                elif n>0:               color=(0,180,0)
-                else:                   color=(180,180,180)
-                if c["side"] >= MIN_CELL_PX:
-                    cv2.fillPoly(overlay, [poly], color)
-                    cv2.polylines(overlay, [poly], True, (50,50,50), 1)
-
-        # ▶ ROI로 클립 후 블렌딩(바깥은 원본 유지)
-        overlay_masked = cv2.bitwise_and(overlay, overlay, mask=roi_mask)
-        out = cv2.addWeighted(overlay_masked, FILL_ALPHA, frame, 1.0-FILL_ALPHA, 0)
-        if not grid_frozen:
-            need = AUTO_MIN_SAMPLES
-            left = max(0, int(AUTO_TIMEOUT_SEC - (time.time() - measure_started)))
-            cv2.putText(out, f"Measuring... samples {len(hbuf)}/{need}  timeout {left}s  [A]=accept now",
-                        (12,100), FONT, 0.7, (0,0,0), 3)
-            cv2.putText(out, f"Measuring... samples {len(hbuf)}/{need}  timeout {left}s  [A]=accept now",
-                        (12,100), FONT, 0.7, (255,255,255), 1)
-        
-        cv2.polylines(out, [roi_poly], True, (0,200,255), 2)
-        mode_txt = "heuristic freeze" if grid_frozen else "measuring..."
-        cv2.putText(out, f"~10 m^2 cells ({mode_txt}), Alert >= {ALERT_THRESHOLD}",
-                    (12,28), FONT, 0.7, (0,0,0), 3)
-        cv2.putText(out, f"~10 m^2 cells ({mode_txt}), Alert >= {ALERT_THRESHOLD}",
-                    (12,28), FONT, 0.7, (255,255,255), 1)
-
-        med_txt = f"med_h={np.median(hbuf):.1f}px" if len(hbuf)>0 else "med_h=--"
-        p_txt = "ON" if grid.perspective_on else "OFF"
-        cv2.putText(out, f"Preset: {PRESET_NAMES[cur_preset]}  x{PRESET_FACTORS[cur_preset]*fine_factor:.2f}  {med_txt}  perspective={p_txt}",
-                    (12,52), FONT, 0.7, (0,0,0), 3)
-        cv2.putText(out, f"Preset: {PRESET_NAMES[cur_preset]}  x{PRESET_FACTORS[cur_preset]*fine_factor:.2f}  {med_txt}  perspective={p_txt}",
-                    (12,52), FONT, 0.7, (255,255,255), 1)
-        cv2.putText(out, "Manual: [1..5]=preset  +/-=size   R=remeasure   P=perspective on/off",
-                    (12,76), FONT, 0.7, (0,0,0), 3)
-        cv2.putText(out, "Manual: [1..5]=preset  +/-=size   R=remeasure   P=perspective on/off",
-                    (12,76), FONT, 0.7, (255,255,255), 1)
-        
-        # 머리로 디텍팅하기 와 발끝으로 디텍팅하기 표시
-        ref_txt = "HEAD" if USE_HEAD_POINT else "FOOT"
-        p_txt = "ON" if grid.perspective_on else "OFF"
-        cv2.putText(out, f"Preset: {PRESET_NAMES[cur_preset]}  x{PRESET_FACTORS[cur_preset]*fine_factor:.2f}  {med_txt}  perspective={p_txt}  ref={ref_txt}  [H/F]",
-                    (12,52), FONT, 0.7, (0,0,0), 3)
-        cv2.putText(out, f"Preset: {PRESET_NAMES[cur_preset]}  x{PRESET_FACTORS[cur_preset]*fine_factor:.2f}  {med_txt}  perspective={p_txt}  ref={ref_txt}  [H/F]",
-                    (12,52), FONT, 0.7, (255,255,255), 1)
-
-
-        show_fit("Person-calibrated Grid Crowd Count", out)
+            # 재측정: 앵커/그리드 초기화
+            calibr.reset(); rt.frozen = False; rt.unit_mid = None; rt.measure_started = time.time(); grid_cache.clear()
 
     cap.release()
     cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
