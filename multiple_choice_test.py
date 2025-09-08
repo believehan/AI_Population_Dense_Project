@@ -3,7 +3,7 @@
 # - 샘플 대역: 화면 높이 20~40%
 # - 프리셋 스케일: 아주작음일수록 셀이 더 큼(1>2>3>4>5)
 # - ROI 밖은 전혀 그리지 않음(오버레이도 ROI로 클립)
-# - P: 원근(행별 2% 축소) 토글
+# - P: 원근(행별 5% 축소) 토글
 
 import subprocess, shutil, time, cv2, math
 import numpy as np
@@ -11,23 +11,33 @@ from collections import deque
 from ultralytics import YOLO
 
 # ========= 기본 설정 =========
-# YOUTUBE_URL = "https://www.youtube.com/live/rnXIjl_Rzy4?feature=shared"
+YOUTUBE_URL = "https://www.youtube.com/live/rnXIjl_Rzy4?feature=shared"
 # YOUTUBE_URL = "https://www.youtube.com/live/EaRgJQ--2eE"
-YOUTUBE_URL = "https://www.youtube.com/watch?v=u4UZ4UvZXrg"
-MODEL   = "yolo11s.pt"
+# YOUTUBE_URL = "https://www.youtube.com/watch?v=u4UZ4UvZXrg"
+MODEL   = "epoch30.pt"
 DEVICE  = "cpu"
 IMGSZ   = 640
 CONF    = 0.35
 USE_HALF= False
 ROWS_TILES, COLS_TILES = 2, 4
 
-# 사람-크기 5지선다 (아주작음일수록 더 큰 셀)
-PRESET_NAMES   = ["아주작음", "작음", "보통", "큼", "아주큼"]
+# --- 자동 측정 관련 ---
+AUTO_MIN_SAMPLES = 12          # 자동확정에 필요한 최소 샘플 수(기존 25 → 12)
+AUTO_TIMEOUT_SEC = 25.0        # 이 시간 지나면 강제 확정
+# 샘플 필터 완화(사람이 적은 장면 대비)
+MIN_H_PX_FOR_SAMPLE = 32       # 36 → 32
+ASPECT_MIN = 1.25              # 1.35 → 1.25
+
+# --- 사람 위치 참조점 설정 ---
+USE_HEAD_POINT = True       # True=머리(y1), False=발끝(y2)
+ROI_TEST_WITH_REF = True    # ROI 포함 여부도 같은 점으로 검사(True 권장)
+
+
+# 사람-크기 5지선다 (Very big 일수록 더 큰 셀)
+PRESET_NAMES   = ["Very big", "big", "Normal", "small", "Very small"] # 사람 크기에 따라 분류
 PRESET_FACTORS = [1.95, 1.75, 1.45, 1.20, 1.00]
 BASE_K_FROM_PERSON_H = 0.90
 MID_BAND = (0.20, 0.40)      # 20~40%
-MIN_H_PX_FOR_SAMPLE = 36
-ASPECT_MIN = 1.35
 
 # 셀/표시
 MIN_CELL_PX = 12
@@ -53,6 +63,13 @@ def show_fit(name, img):
     cv2.imshow(name, resize_to_fit(img))
 def compute_fit_scale(w, h, max_w=DISPLAY_MAX_W, max_h=DISPLAY_MAX_H):
     return min(max_w / w, max_h / h, 1.0)
+
+def ref_point(x1, y1, x2, y2, use_head=True):
+    """사람 박스의 기준점 반환 (머리 or 발끝)"""
+    cx = 0.5 * (x1 + x2)
+    cy = y1 if use_head else y2
+    return cx, cy
+
 
 # ========= streamlink =========
 def resolve_stream(url: str) -> str:
@@ -204,6 +221,7 @@ class VarSquareGrid:
 
 # ========= 메인 =========
 def main():
+    global USE_HEAD_POINT   # ← 이 줄 추가 (머리/발끝 토글 변수는 전역 정의였으니)
     stream_url = resolve_stream(YOUTUBE_URL)
     cap = cv2.VideoCapture(stream_url)
     if not cap.isOpened(): raise RuntimeError("VideoCapture 열기 실패")
@@ -223,10 +241,11 @@ def main():
     gamma = 1.0
 
     # --- NEW: ROI 확정 즉시 보이는 임시 격자 ---
-    fallback_h_px = max(MIN_H_PX_FOR_SAMPLE, int(0.065 * fr_h))  # 프레임 높이의 ~6.5%를 임시 사람키로 가정
-    init_side = max(MIN_CELL_PX, min(MAX_CELL_PX,
-                int(BASE_K_FROM_PERSON_H * fallback_h_px * PRESET_FACTORS[cur_preset] * fine_factor)))
-    grid.build(init_side)          # 미리 한 번 그려주기 (자동 측정 끝나면 덮어씀)
+    # fallback_h_px = max(MIN_H_PX_FOR_SAMPLE, int(0.065 * fr_h))  # 프레임 높이의 ~6.5%를 임시 사람키로 가정
+    # init_side = max(MIN_CELL_PX, min(MAX_CELL_PX,
+    #             int(BASE_K_FROM_PERSON_H * fallback_h_px * PRESET_FACTORS[cur_preset] * fine_factor)))
+    # grid.build(init_side)          # 미리 한 번 그려주기 (자동 측정 끝나면 덮어씀)
+    measure_started = time.time()   # <-- NEW: 자동 측정 타이머 시작
 
     hbuf = deque(maxlen=300)
     last_auto = 0.0
@@ -254,37 +273,71 @@ def main():
                 all_boxes.append([x1+ox, y1+oy, x2+ox, y2+oy, float(cf)])
         kept = nms_global(all_boxes, iou_th=0.55)
 
-        # A) 샘플 수집(20~40%, ROI 내부)
-        y_low  = int(MID_BAND[0] * fr_h)
-        y_high = int(MID_BAND[1] * fr_h)
+        # # A) 샘플 수집(20~40% + 부족하면 40~65%) 발끝
+        # y_low, y_high = int(MID_BAND[0]*fr_h), int(MID_BAND[1]*fr_h)
+        # y_low2, y_high2 = int(0.40*fr_h), int(0.65*fr_h)  # 보조 밴드
+
+        # if not grid_frozen:
+        #     for x1,y1,x2,y2,cf in kept:
+        #         if cf < 0.35:   # 0.45 → 0.35 (완화)
+        #             continue
+        #         h = y2-y1; w = x2-x1
+        #         if h < MIN_H_PX_FOR_SAMPLE or w <= 0:
+        #             continue
+        #         if (h/(w+1e-9)) < ASPECT_MIN:
+        #             continue
+        #         footx = 0.5*(x1+x2); footy = y2
+        #         if roi_mask[int(min(max(footy,0),fr_h-1)), int(min(max(footx,0),fr_w-1))] == 0:
+        #             continue
+
+        #         # 기본 밴드 또는 보조 밴드에서 수집
+        #         if y_low <= footy <= y_high or y_low2 <= footy <= y_high2:
+        #             hbuf.append(h)
+        
+        # A) 샘플 수집(20~40% + 부족하면 40~65%, ROI 내부) 머리
+        y_low, y_high   = int(MID_BAND[0]*fr_h), int(MID_BAND[1]*fr_h)
+        y_low2, y_high2 = int(0.40*fr_h), int(0.65*fr_h)
+
         if not grid_frozen:
             for x1,y1,x2,y2,cf in kept:
-                if cf < 0.45: continue
-                h = y2-y1; w = x2-x1
-                if h < MIN_H_PX_FOR_SAMPLE or w <= 0: continue
-                if (h/(w+1e-9)) < ASPECT_MIN: continue
-                footx = 0.5*(x1+x2); footy = y2
-                if y_low <= footy <= y_high and roi_mask[int(min(max(footy,0),fr_h-1)), int(min(max(footx,0),fr_w-1))] != 0:
+                if cf < 0.35: 
+                    continue
+                h = y2 - y1; w = x2 - x1
+                if h < MIN_H_PX_FOR_SAMPLE or w <= 0:
+                    continue
+                if (h/(w+1e-9)) < ASPECT_MIN:
+                    continue
+
+                rx, ry = ref_point(x1,y1,x2,y2, use_head=USE_HEAD_POINT)
+                # ROI 포함 검사
+                testx, testy = (rx, ry) if ROI_TEST_WITH_REF else ref_point(x1,y1,x2,y2, use_head=False)  # False=발끝
+                if roi_mask[int(min(max(testy,0),fr_h-1)), int(min(max(testx,0),fr_w-1))] == 0:
+                    continue
+
+                # 밴드 조건
+                if y_low <= ry <= y_high or y_low2 <= ry <= y_high2:
                     hbuf.append(h)
+
 
         # B) 자동 프리셋(처음만)
         now = time.time()
-        if (not grid_frozen) and (now - last_auto > AUTO_RECALC_SEC) and len(hbuf) >= 25:
-            med_h = float(np.median(hbuf))
-            r = med_h / fr_h
-            if   r < 0.035: cur_preset = 0
-            elif r < 0.055: cur_preset = 1
-            elif r < 0.075: cur_preset = 2
-            elif r < 0.095: cur_preset = 3
-            else:           cur_preset = 4
-            base_side = max(MIN_CELL_PX,
-                            min(MAX_CELL_PX, BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
-            if grid.build(base_side) and FREEZE_AFTER_FIRST_BUILD:
-                grid_frozen = True
-            last_auto = now
+        enough_samples = (len(hbuf) >= AUTO_MIN_SAMPLES)
+        timeout_passed = ((now - measure_started) > AUTO_TIMEOUT_SEC and len(hbuf) >= max(5, AUTO_MIN_SAMPLES//2))
+
+        if (not grid_frozen) and (enough_samples or timeout_passed):
+            if len(hbuf) > 0:
+                med_h = float(np.median(hbuf))
+            else:
+                med_h = max(MIN_H_PX_FOR_SAMPLE, int(0.065 * fr_h))  # 완전 무샘플이면 안전한 대체값
+            base_side = max(MIN_CELL_PX, min(MAX_CELL_PX,
+                        BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
+            grid.build(base_side)
+            grid_frozen = True
+
 
         # C) 수동/재측정/토글
         k = cv2.waitKey(1) & 0xFF
+
         if k in (27, ord('q')): break
         if k in (ord('1'),ord('2'),ord('3'),ord('4'),ord('5')):
             cur_preset = int(chr(k)) - 1
@@ -304,6 +357,12 @@ def main():
             base_side = max(MIN_CELL_PX,
                             min(MAX_CELL_PX, BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
             grid.build(base_side); grid_frozen = True
+            
+        elif k in (ord('h'), ord('H')):
+            USE_HEAD_POINT = True     # 머리 기준
+        elif k in (ord('f'), ord('F')):
+            USE_HEAD_POINT = False    # 발끝 기준
+            
         elif k in (ord('r'), ord('R')):
             hbuf.clear(); last_auto = 0.0; grid_frozen = False
         elif k in (ord('p'), ord('P')):
@@ -314,15 +373,29 @@ def main():
                             min(MAX_CELL_PX, BASE_K_FROM_PERSON_H * med_h * PRESET_FACTORS[cur_preset] * fine_factor))
             grid.build(base_side)
 
-        # D) 카운트(발끝이 ROI 안일 때만)
+        # # D) 카운트(발끝이 ROI 안일 때만)
+        # counts = {}
+        # if grid.base_side is not None:
+        #     for x1,y1,x2,y2,cf in kept:
+        #         footx = 0.5*(x1+x2); footy = y2
+        #         if roi_mask[int(min(max(footy,0),fr_h-1)), int(min(max(footx,0),fr_w-1))] == 0: continue
+        #         idx = grid.locate(footx, footy)
+        #         if idx is None: continue
+        #         counts[idx] = counts.get(idx, 0) + 1
+        
+        # D) 카운트(참조점(머리)이 ROI 안일 때만)
         counts = {}
         if grid.base_side is not None:
             for x1,y1,x2,y2,cf in kept:
-                footx = 0.5*(x1+x2); footy = y2
-                if roi_mask[int(min(max(footy,0),fr_h-1)), int(min(max(footx,0),fr_w-1))] == 0: continue
-                idx = grid.locate(footx, footy)
-                if idx is None: continue
+                rx, ry = ref_point(x1,y1,x2,y2, use_head=USE_HEAD_POINT)
+                testx, testy = (rx, ry) if ROI_TEST_WITH_REF else ref_point(x1,y1,x2,y2, use_head=False)
+                if roi_mask[int(min(max(testy,0),fr_h-1)), int(min(max(testx,0),fr_w-1))] == 0:
+                    continue
+                idx = grid.locate(rx, ry)
+                if idx is None: 
+                    continue
                 counts[idx] = counts.get(idx, 0) + 1
+
 
         # E) 렌더링(ROI와 전혀 겹치지 않는 셀은 숨김) + ROI 마스크로 클립
         overlay = frame.copy()
@@ -342,7 +415,14 @@ def main():
         # ▶ ROI로 클립 후 블렌딩(바깥은 원본 유지)
         overlay_masked = cv2.bitwise_and(overlay, overlay, mask=roi_mask)
         out = cv2.addWeighted(overlay_masked, FILL_ALPHA, frame, 1.0-FILL_ALPHA, 0)
-
+        if not grid_frozen:
+            need = AUTO_MIN_SAMPLES
+            left = max(0, int(AUTO_TIMEOUT_SEC - (time.time() - measure_started)))
+            cv2.putText(out, f"Measuring... samples {len(hbuf)}/{need}  timeout {left}s  [A]=accept now",
+                        (12,100), FONT, 0.7, (0,0,0), 3)
+            cv2.putText(out, f"Measuring... samples {len(hbuf)}/{need}  timeout {left}s  [A]=accept now",
+                        (12,100), FONT, 0.7, (255,255,255), 1)
+        
         cv2.polylines(out, [roi_poly], True, (0,200,255), 2)
         mode_txt = "heuristic freeze" if grid_frozen else "measuring..."
         cv2.putText(out, f"~10 m^2 cells ({mode_txt}), Alert >= {ALERT_THRESHOLD}",
@@ -360,6 +440,15 @@ def main():
                     (12,76), FONT, 0.7, (0,0,0), 3)
         cv2.putText(out, "Manual: [1..5]=preset  +/-=size   R=remeasure   P=perspective on/off",
                     (12,76), FONT, 0.7, (255,255,255), 1)
+        
+        # 머리로 디텍팅하기 와 발끝으로 디텍팅하기 표시
+        ref_txt = "HEAD" if USE_HEAD_POINT else "FOOT"
+        p_txt = "ON" if grid.perspective_on else "OFF"
+        cv2.putText(out, f"Preset: {PRESET_NAMES[cur_preset]}  x{PRESET_FACTORS[cur_preset]*fine_factor:.2f}  {med_txt}  perspective={p_txt}  ref={ref_txt}  [H/F]",
+                    (12,52), FONT, 0.7, (0,0,0), 3)
+        cv2.putText(out, f"Preset: {PRESET_NAMES[cur_preset]}  x{PRESET_FACTORS[cur_preset]*fine_factor:.2f}  {med_txt}  perspective={p_txt}  ref={ref_txt}  [H/F]",
+                    (12,52), FONT, 0.7, (255,255,255), 1)
+
 
         show_fit("Person-calibrated Grid Crowd Count", out)
 
