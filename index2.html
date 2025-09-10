@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>인구밀집 모니터링 상황실</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0c1421, #1a2332);
+            color: #00ff88;
+            overflow: hidden;
+            height: 100vh;
+        }
+        .header {
+            background: rgba(0, 0, 0, 0.8);
+            padding: 10px 20px;
+            border-bottom: 2px solid #00ff88;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 1.5rem; text-shadow: 0 0 10px #00ff88; }
+        .header-info { display: flex; gap: 20px; font-size: 0.9rem; }
+        .status-indicator {
+            display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+            background: #00ff88; margin-right: 5px; animation: pulse 2s infinite;
+        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .main-container { display: flex; height: calc(100vh - 60px); }
+        .camera-section { flex: 1; display: flex; flex-direction: column; padding: 10px; }
+        .camera-tabs { display: flex; gap: 5px; margin-bottom: 10px; }
+        .camera-tab {
+            padding: 8px 16px; background: rgba(0, 20, 40, 0.8);
+            border: 2px solid #555; border-radius: 8px 8px 0 0;
+            color: #999; cursor: pointer; transition: all 0.3s;
+            font-weight: bold; font-size: 0.9rem;
+        }
+        .camera-tab.active {
+            background: rgba(0, 255, 136, 0.2); border-color: #00ff88; color: #00ff88;
+            box-shadow: 0 0 10px rgba(0, 255, 136, 0.3);
+        }
+        .camera-tab:hover { border-color: #00ff88; color: #00ff88; }
+        .main-camera-panel {
+            background: rgba(0, 20, 40, 0.8); border: 2px solid #00ff88;
+            border-radius: 0 8px 8px 8px; position: relative; overflow: hidden;
+            flex: 1; display: flex; flex-direction: column;
+        }
+        .main-camera-header {
+            background: rgba(0, 255, 136, 0.2); padding: 12px 15px;
+            font-size: 1.1rem; font-weight: bold; border-bottom: 1px solid #00ff88;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .main-camera-feed {
+            flex: 1; background: #000; display: flex; align-items: center;
+            justify-content: center; font-size: 1.5rem; color: #666;
+            position: relative; min-height: 400px;
+            padding: 5px;
+        }
+        .camera-offline { color: #ff4444; }
+        .frame-info {
+            font-size: 0.9rem; background: rgba(0, 0, 0, 0.7);
+            padding: 4px 8px; border-radius: 3px;
+        }
+        
+        /* 🔥 영상 및 클릭 가능한 구역 스타일 */
+        .camera-video {
+            max-width: 100%;
+            max-height: 100%;
+            min-width: 80%;
+            min-height: 80%;
+            object-fit: contain;
+            border-radius: 4px;
+            background-color: #000;
+        }
+        .video-wrapper {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            background-color: #000;
+            min-height: 300px;
+            position: relative;
+        }
+        
+        /* 🔥 클릭 가능한 구역 오버레이 */
+        .zone-overlay {
+            position: absolute;
+            background: rgba(0, 255, 136, 0.1);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            z-index: 10;
+            opacity: 0.7;
+        }
+        .zone-overlay:hover {
+            background: rgba(0, 255, 136, 0.3);
+            box-shadow: 0 0 15px rgba(0, 255, 136, 0.8);
+            transform: scale(1.02);
+        }
+        .zone-label {
+            position: absolute;
+            top: -25px;
+            left: 5px;
+            background: rgba(0, 255, 136, 0.9);
+            color: #000;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        /* 🔥 팝업 모달 스타일 */
+        .popup-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        .popup-content {
+            background: rgba(0, 30, 60, 0.95);
+            border: 3px solid #00ff88;
+            border-radius: 10px;
+            padding: 20px;
+            max-width: 80%;
+            max-height: 80%;
+            position: relative;
+            box-shadow: 0 0 30px rgba(0, 255, 136, 0.5);
+        }
+        .popup-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #00ff88;
+        }
+        .popup-title {
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: #00ff88;
+            text-shadow: 0 0 5px #00ff88;
+        }
+        .close-btn {
+            background: #ff4444;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1.2rem;
+            font-weight: bold;
+        }
+        .close-btn:hover {
+            background: #ff6666;
+            box-shadow: 0 0 10px rgba(255, 68, 68, 0.5);
+        }
+        .popup-video {
+            width: 600px;
+            height: 400px;
+            object-fit: contain;
+            border-radius: 5px;
+            background: #000;
+        }
+        
+        .sidebar {
+            width: 350px; background: rgba(0, 30, 60, 0.9);
+            border-left: 2px solid #00ff88; padding: 20px; overflow-y: auto;
+        }
+        .stats-section { margin-bottom: 30px; }
+        .stats-title {
+            font-size: 1.2rem; font-weight: bold; margin-bottom: 15px;
+            text-shadow: 0 0 5px #00ff88;
+        }
+        .stat-item {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 10px; margin: 5px 0; background: rgba(0, 0, 0, 0.3);
+            border-radius: 5px; border-left: 3px solid #00ff88;
+        }
+        .stat-value { font-size: 1.5rem; font-weight: bold; }
+        .alert-section {
+            background: rgba(255, 68, 68, 0.1); border: 1px solid #ff4444;
+            border-radius: 8px; padding: 15px; margin: 15px 0;
+        }
+        .alert-title { color: #ff4444; font-weight: bold; margin-bottom: 10px; }
+        .alert-item {
+            background: rgba(255, 68, 68, 0.2); padding: 8px; margin: 5px 0;
+            border-radius: 4px; font-size: 0.9rem;
+        }
+        .camera-controls {
+            margin-top: 20px; padding: 15px; background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+        }
+        .control-button {
+            background: rgba(0, 255, 136, 0.2); border: 1px solid #00ff88;
+            color: #00ff88; padding: 8px 15px; margin: 5px; border-radius: 4px;
+            cursor: pointer; transition: all 0.3s;
+        }
+        .control-button:hover {
+            background: rgba(0, 255, 136, 0.3);
+            box-shadow: 0 0 10px rgba(0, 255, 136, 0.5);
+        }
+        .timestamp { font-size: 0.8rem; opacity: 0.7; }
+        
+        /* 🔥 구역 설명 패널 */
+        .zone-info {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 10px;
+            margin-top: 10px;
+            border-radius: 5px;
+            border-left: 3px solid #00ff88;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔍 인구밀집 모니터링 상황실</h1>
+        <div class="header-info">
+            <span><span class="status-indicator"></span>활성 카메라: <span id="active-cameras">0</span></span>
+            <span>총 탐지 인원: <span id="total-detections">0</span></span>
+            <span class="timestamp" id="current-time">--</span>
+        </div>
+    </div>
+
+    <div class="main-container">
+        <div class="camera-section">
+            <!-- 카메라 선택 탭 -->
+            <div class="camera-tabs">
+                <div class="camera-tab active" onclick="switchCamera('main')" id="tab-main">MAIN</div>
+                <div class="camera-tab" onclick="switchCamera(1)" id="tab-1">CAM 1</div>
+                <div class="camera-tab" onclick="switchCamera(2)" id="tab-2">CAM 2</div>
+                <div class="camera-tab" onclick="switchCamera(3)" id="tab-3">CAM 3</div>
+                <div class="camera-tab" onclick="switchCamera(4)" id="tab-4">CAM 4</div>
+            </div>
+
+            <!-- 메인 카메라 화면 -->
+            <div class="main-camera-panel">
+                <div class="main-camera-header">
+                    <span id="current-camera-title">📹 MAIN VIEW - 전체 화면 (구역 클릭 가능)</span>
+                    <div class="frame-info">Frame: <span id="current-frame">--</span></div>
+                </div>
+                <div class="main-camera-feed" id="main-camera-feed">
+                    <div class="video-wrapper" id="video-wrapper">
+                        <img src="/camera/main" 
+                             class="camera-video" id="main-video"
+                             onload="updateFrameInfo('main')"
+                             onerror="handleVideoError('main')">
+                        <!-- 🔥 클릭 가능한 구역 오버레이들 (MAIN 화면에서만 표시) -->
+                        <div class="zone-overlay" id="zone-1" onclick="openZonePopup(1)" style="display: none;">
+                            <div class="zone-label">ZONE 1</div>
+                        </div>
+                        <div class="zone-overlay" id="zone-2" onclick="openZonePopup(2)" style="display: none;">
+                            <div class="zone-label">ZONE 2</div>
+                        </div>
+                        <div class="zone-overlay" id="zone-3" onclick="openZonePopup(3)" style="display: none;">
+                            <div class="zone-label">ZONE 3</div>
+                        </div>
+                        <div class="zone-overlay" id="zone-4" onclick="openZonePopup(4)" style="display: none;">
+                            <div class="zone-label">ZONE 4</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            <div class="stats-section">
+                <div class="stats-title">📊 실시간 통계</div>
+                <div class="stat-item"><span>Zone - 1</span><span class="stat-value" id="total-count">0</span></div>
+                <div class="stat-item"><span>Zone - 2</span><span class="stat-value" id="current-count">0</span></div>
+                <div class="stat-item"><span>Zone - 3</span><span class="stat-value" id="crowded-areas">0</span></div>
+                <div class="stat-item"><span>Zone - 4</span><span class="stat-value" id="active-cams">0</span></div>
+            </div>
+
+            <div class="alert-section">
+                <div class="alert-title">⚠️ 실시간 알림</div>
+                <div id="alerts-container">
+                    <div class="alert-item">시스템 대기중...</div>
+                </div>
+            </div>
+
+            <!-- 🔥 구역 정보 패널 -->
+            <div class="zone-info">
+                <div class="stats-title">🎯 구역 안내</div>
+                <p style="font-size: 0.9rem; line-height: 1.4;">
+                    MAIN 화면에서 원하는 구역을 클릭하면<br>
+                    해당 구역의 상세 모니터링 창이 팝업으로 열립니다.
+                </p>
+            </div>
+
+            <div class="camera-controls">
+                <div class="stats-title">📹 카메라 상태</div>
+                <button class="control-button" onclick="toggleCamera('main')">MAIN ON/OFF</button>
+                <button class="control-button" onclick="toggleCamera(1)">CAM 1 ON/OFF</button>
+                <button class="control-button" onclick="toggleCamera(2)">CAM 2 ON/OFF</button>
+                <button class="control-button" onclick="toggleCamera(3)">CAM 3 ON/OFF</button>
+                <button class="control-button" onclick="toggleCamera(4)">CAM 4 ON/OFF</button>
+                <div style="margin-top: 15px;">
+                    <button class="control-button" onclick="refreshAll()">전체 새로고침</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 🔥 구역 팝업 모달 -->
+    <div class="popup-modal" id="zone-popup">
+        <div class="popup-content">
+            <div class="popup-header">
+                <div class="popup-title" id="popup-title">📹 ZONE 1 - 상세 모니터링</div>
+                <button class="close-btn" onclick="closeZonePopup()">✕</button>
+            </div>
+            <img class="popup-video" id="popup-video" src="">
+        </div>
+    </div>
+
+    <script>
+        // 🔥 구역 좌표 정의 (app.py의 실제 좌표를 기반으로 조정)
+        // 영상 해상도가 대략 1280x720이라고 가정하고 계산
+        const zoneCoords = {
+            1: { left: '45.0%', top: '32.3%', width: '6.7%', height: '11.7%' },   // (866,326) → (990,439)
+            2: { left: '54.3%', top: '25.6%', width: '8.0%', height: '12.5%' },  // (1053,242) → (1184,361)  
+            3: { left: '0.4%', top: '55.4%', width: '20.8%', height: '30.5%' },   // (5,658) → (374,1007)
+            4: { left: '55.2%', top: '37.8%', width: '13.0%', height: '15.2%' }   // (1065,380) → (1297,583)
+        };
+
+        // 시간 업데이트
+        function updateTime() {
+            const now = new Date();
+            const timeString = now.toLocaleString('ko-KR', {
+                year: 'numeric', month: 'numeric', day: 'numeric',
+                hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+            });
+            document.getElementById('current-time').textContent = timeString;
+        }
+
+        // 🔥 구역 오버레이 표시/숨김
+        function toggleZoneOverlays(show) {
+            Object.keys(zoneCoords).forEach(zoneId => {
+                const overlay = document.getElementById(`zone-${zoneId}`);
+                if (show) {
+                    const coords = zoneCoords[zoneId];
+                    overlay.style.left = coords.left;
+                    overlay.style.top = coords.top;
+                    overlay.style.width = coords.width;
+                    overlay.style.height = coords.height;
+                    overlay.style.display = 'block';
+                } else {
+                    overlay.style.display = 'none';
+                }
+            });
+        }
+
+        // 카메라 전환 함수
+        let currentCamera = 'main';
+        function switchCamera(cameraId) {
+            // 이전 탭 비활성화
+            const prevTab = document.getElementById(`tab-${currentCamera}`);
+            if (prevTab) prevTab.classList.remove('active');
+            
+            // 새 탭 활성화
+            document.getElementById(`tab-${cameraId}`).classList.add('active');
+            
+            // 제목 업데이트
+            let title = '';
+            if (cameraId === 'main') {
+                title = '📹 MAIN VIEW - 전체 화면 (구역 클릭 가능)';
+                // 🔥 MAIN 화면에서만 구역 오버레이 표시
+                setTimeout(() => toggleZoneOverlays(true), 500);
+            } else {
+                title = `📹 PUBLIC CCTV ${cameraId} - CAM_0${cameraId}`;
+                // 🔥 개별 카메라에서는 구역 오버레이 숨김
+                toggleZoneOverlays(false);
+            }
+            document.getElementById('current-camera-title').textContent = title;
+            
+            // 영상 스트림 업데이트
+            const feedElement = document.getElementById('main-camera-feed');
+            feedElement.innerHTML = `
+                <div class="video-wrapper" id="video-wrapper">
+                    <img src="/camera/${cameraId}" 
+                         class="camera-video" id="main-video"
+                         onload="updateFrameInfo('${cameraId}')"
+                         onerror="handleVideoError('${cameraId}')">
+                    <!-- 구역 오버레이들 -->
+                    <div class="zone-overlay" id="zone-1" onclick="openZonePopup(1)" style="display: none;">
+                        <div class="zone-label">ZONE 1</div>
+                    </div>
+                    <div class="zone-overlay" id="zone-2" onclick="openZonePopup(2)" style="display: none;">
+                        <div class="zone-label">ZONE 2</div>
+                    </div>
+                    <div class="zone-overlay" id="zone-3" onclick="openZonePopup(3)" style="display: none;">
+                        <div class="zone-label">ZONE 3</div>
+                    </div>
+                    <div class="zone-overlay" id="zone-4" onclick="openZonePopup(4)" style="display: none;">
+                        <div class="zone-label">ZONE 4</div>
+                    </div>
+                </div>`;
+            feedElement.classList.remove('camera-offline');
+            currentCamera = cameraId;
+            
+            // MAIN 화면이면 잠시 후 오버레이 표시
+            if (cameraId === 'main') {
+                setTimeout(() => {
+                    const videoElement = document.getElementById('main-video');
+                    if (videoElement) {
+                        // 영상 로딩 완료 대기 후 구역 오버레이 표시
+                        if (videoElement.complete) {
+                            calculateZonePosition(videoElement);
+                        } else {
+                            videoElement.onload = () => calculateZonePosition(videoElement);
+                        }
+                    }
+                }, 500);
+            }
+        }
+
+        // 🔥 구역 팝업 열기
+        function openZonePopup(zoneId) {
+            const popup = document.getElementById('zone-popup');
+            const popupTitle = document.getElementById('popup-title');
+            const popupVideo = document.getElementById('popup-video');
+            
+            popupTitle.textContent = `📹 ZONE ${zoneId} - 상세 모니터링`;
+            popupVideo.src = `/camera/${zoneId}`;
+            popup.style.display = 'flex';
+            
+            console.log(`ZONE ${zoneId} 팝업 열림`);
+        }
+
+        // 🔥 구역 팝업 닫기
+        function closeZonePopup() {
+            const popup = document.getElementById('zone-popup');
+            const popupVideo = document.getElementById('popup-video');
+            
+            popup.style.display = 'none';
+            popupVideo.src = ''; // 영상 스트림 정지
+        }
+
+        // 🔥 ESC 키로 팝업 닫기
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                closeZonePopup();
+            }
+        });
+
+        // 🔥 팝업 바깥 클릭으로 닫기
+        document.getElementById('zone-popup').addEventListener('click', function(event) {
+            if (event.target === this) {
+                closeZonePopup();
+            }
+        });
+
+        function updateFrameInfo(cameraId) {
+            if (cameraId === 'main') {
+                document.getElementById('current-frame').textContent = 'Live - MAIN';
+            } else {
+                document.getElementById('current-frame').textContent = `Live - CAM_0${cameraId}`;
+            }
+        }
+        
+        function handleVideoError(cameraId) {
+            const feedElement = document.getElementById('main-camera-feed');
+            const errorMsg = cameraId === 'main' ? 'MAIN VIEW' : `카메라 ${cameraId}`;
+            feedElement.innerHTML = `<div style="color:#ff4444;">📹 ${errorMsg} 연결 실패</div>`;
+        }
+
+        // API 데이터 가져오기
+        async function fetchStats() {
+            try {
+                const response = await fetch('/api/detection_stats');
+                const data = await response.json();
+                document.getElementById('total-count').textContent = data.total_detections || 0;
+                document.getElementById('active-cams').textContent = data.active_cameras || 0;
+                document.getElementById('active-cameras').textContent = data.active_cameras || 0;
+                document.getElementById('total-detections').textContent = data.total_detections || 0;
+            } catch (e) { console.log('통계 대기중...'); }
+        }
+
+        async function fetchAlerts() {
+            try {
+                const response = await fetch('/api/alerts');
+                const data = await response.json();
+                const alertsContainer = document.getElementById('alerts-container');
+                if (data.alerts && data.alerts.length > 0) {
+                    alertsContainer.innerHTML = data.alerts.map(alert =>
+                        `<div class="alert-item">${alert}</div>`).join('');
+                }
+            } catch (e) { console.log('알림 대기중...'); }
+        }
+
+        function toggleCamera(cameraId) { console.log(`카메라 ${cameraId} 토글`); }
+        function refreshAll() { 
+            fetchStats(); 
+            fetchAlerts(); 
+            switchCamera(currentCamera);
+        }
+
+        // 주기적 업데이트
+        setInterval(updateTime, 1000);
+        setInterval(fetchStats, 5000);
+        setInterval(fetchAlerts, 10000);
+
+        // 초기 로드
+        updateTime(); 
+        fetchStats(); 
+        fetchAlerts(); 
+        switchCamera('main');
+    </script>
+</body>
+</html>

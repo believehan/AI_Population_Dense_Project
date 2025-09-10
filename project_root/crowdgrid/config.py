@@ -20,7 +20,7 @@ class AppConfig:
     """
     # 입력/모델
     # source: str = "https://www.youtube.com/live/rnXIjl_Rzy4?feature=shared" # Streamlink로 여는 YouTube 주소 또는 파일경로. 소스 교체 시만 변경.
-    source: str = "./test_bucheon.mp4" # Streamlink로 여는 YouTube 주소 또는 파일경로. 소스 교체 시만 변경.
+    source: str = "AI_Population_Dense_Project/buchoen_station_square_3.mp4" # Streamlink로 여는 YouTube 주소 또는 파일경로. 소스 교체 시만 변경.
     model_path: str = "epoch40.pt"
     device: str = "cpu" # "cpu" 또는 "cuda"/"cuda:0". GPU 사용 시 "cuda" 권장. (예측 인자에 device 지원)
     imgsz: int = 640 # 입력 리사이즈 크기. 기본 640. 작게 하면 빠르고, 크게 하면 정확도↑(속도↓). (예측 인자 imgsz)
@@ -59,6 +59,24 @@ class AppConfig:
     display_max_w: int = 1280
     display_max_h: int = 720
     win_name: str = "Crowd Grid (Modular)" # OpenCV 창 이름.
+    
+    # === 카메라 기하 기반 스케일 모드 ===
+    use_cam_geom: bool = False               # 체크되면 기하 기반 모드 사용
+    cam_height_m: Optional[float] = None     # 카메라 높이 H (m)
+    cam_pitch_deg: Optional[float] = None    # 피치각 θ (아래로 +deg)
+
+    # 내부파라미터(직접 입력용). 전부 None이면 FOV로부터 fx/fy를 계산 시도
+    fx: Optional[float] = None
+    fy: Optional[float] = None
+    cx: Optional[float] = None
+    cy: Optional[float] = None
+
+    # FOV 입력용(선택): fx/fy가 None일 때만 사용
+    fov_h_deg: Optional[float] = None
+    fov_v_deg: Optional[float] = None
+
+    # 목표 셀 실면적(m^2). None이면 기하 모드 사용 불가
+    target_cell_area_m2: Optional[float] = None
 
 
 @dataclass
