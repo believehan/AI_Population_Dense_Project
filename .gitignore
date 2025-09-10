@@ -6,3 +6,5 @@
 *.json
 *.pyc
 *.zip
+*.engine
+*.txt
